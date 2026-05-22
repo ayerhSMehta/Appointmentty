@@ -1,0 +1,1221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Appointment Manager</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50:'#eff6ff', 100:'#dbeafe', 200:'#bfdbfe', 300:'#93c5fd', 400:'#60a5fa', 500:'#3b82f6', 600:'#2563eb', 700:'#1d4ed8', 800:'#1e40af', 900:'#1e3a8a' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+    .slot-available { transition: all 0.15s ease; }
+    .slot-available:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(59,130,246,0.25); }
+    .fade-in { animation: fadeIn 0.2s ease; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+    .calendar-day { transition: all 0.1s ease; }
+    .calendar-day:hover:not(.disabled) { transform: scale(1.05); }
+    input[type="time"]::-webkit-calendar-picker-indicator { opacity: 0.6; cursor: pointer; }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// Change this to your deployed backend URL when going live
+// e.g. 'https://appointment-app.onrender.com'
+const API = window.location.hostname === 'localhost' ? 'http://localhost:8000' : 'https://YOUR-APP.onrender.com';
+const ax = axios.create({ baseURL: API });
+
+// Attach stored admin token to every request
+ax.interceptors.request.use(cfg => {
+  const token = localStorage.getItem('admin_token');
+  if (token) cfg.headers['X-Admin-Token'] = token;
+  return cfg;
+});
+
+function getAdminToken() { return localStorage.getItem('admin_token'); }
+function setAdminToken(t) { localStorage.setItem('admin_token', t); }
+function clearAdminToken() { localStorage.removeItem('admin_token'); }
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function today() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function formatDate(str) {
+  if (!str) return '';
+  const [y,m,d] = str.split('-');
+  return `${d} ${MONTHS[parseInt(m)-1]} ${y}`;
+}
+
+function formatTime(t) {
+  if (!t) return '';
+  const [h, m] = t.split(':').map(Number);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const hour = h % 12 || 12;
+  return `${hour}:${String(m).padStart(2,'0')} ${ampm}`;
+}
+
+// ─── Toast ─────────────────────────────────────────────────────────────────────
+function Toast({ toasts, remove }) {
+  return (
+    <div className="fixed top-4 right-4 z-50 flex flex-col gap-2">
+      {toasts.map(t => (
+        <div key={t.id} className={`fade-in flex items-center gap-3 px-4 py-3 rounded-xl shadow-lg text-sm font-medium text-white max-w-xs
+          ${t.type === 'success' ? 'bg-emerald-500' : t.type === 'error' ? 'bg-red-500' : 'bg-blue-500'}`}>
+          <span className="text-lg">{t.type === 'success' ? '✓' : t.type === 'error' ? '✕' : 'ℹ'}</span>
+          <span className="flex-1">{t.message}</span>
+          <button onClick={() => remove(t.id)} className="opacity-70 hover:opacity-100 text-white ml-1">×</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function useToast() {
+  const [toasts, setToasts] = useState([]);
+  const add = useCallback((message, type = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4000);
+  }, []);
+  const remove = useCallback((id) => setToasts(prev => prev.filter(t => t.id !== id)), []);
+  return { toasts, add, remove };
+}
+
+// ─── Mini Calendar ─────────────────────────────────────────────────────────────
+function MiniCalendar({ year, month, calData, selectedDate, onSelectDate, onMonthChange }) {
+  const firstDay = new Date(year, month - 1, 1).getDay(); // 0=Sun
+  const adjustedFirst = (firstDay + 6) % 7; // shift to Mon=0
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const dataMap = {};
+  (calData || []).forEach(d => { dataMap[d.date] = d; });
+  const todayStr = today();
+
+  const cells = [];
+  for (let i = 0; i < adjustedFirst; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const ds = `${year}-${String(month).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    cells.push({ date: ds, day: d, info: dataMap[ds] });
+  }
+
+  function getDayStyle(cell) {
+    if (!cell) return '';
+    const info = cell.info;
+    const isPast = cell.date < todayStr;
+    const isSelected = cell.date === selectedDate;
+    const isToday = cell.date === todayStr;
+
+    if (isSelected) return 'bg-blue-600 text-white shadow-md scale-105';
+    if (isPast) return 'text-slate-300 cursor-default';
+    if (!info || !info.is_working) return 'text-slate-300 cursor-default';
+    if (info.available_slots === 0) return 'bg-red-50 text-red-400 cursor-not-allowed';
+    if (isToday) return 'bg-blue-50 text-blue-700 font-bold border-2 border-blue-300 cursor-pointer hover:bg-blue-100';
+    return 'bg-white text-slate-700 hover:bg-blue-50 cursor-pointer border border-slate-200';
+  }
+
+  function isClickable(cell) {
+    if (!cell) return false;
+    if (cell.date < todayStr) return false;
+    if (!cell.info || !cell.info.is_working) return false;
+    if (cell.info.available_slots === 0) return false;
+    return true;
+  }
+
+  return (
+    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5">
+      <div className="flex items-center justify-between mb-4">
+        <button onClick={() => onMonthChange(-1)} className="w-8 h-8 rounded-full hover:bg-slate-100 flex items-center justify-center text-slate-500 hover:text-slate-700 transition-colors">‹</button>
+        <h3 className="font-semibold text-slate-700 text-sm">{MONTHS[month-1]} {year}</h3>
+        <button onClick={() => onMonthChange(1)} className="w-8 h-8 rounded-full hover:bg-slate-100 flex items-center justify-center text-slate-500 hover:text-slate-700 transition-colors">›</button>
+      </div>
+      <div className="grid grid-cols-7 gap-1 mb-2">
+        {DAYS.map(d => <div key={d} className="text-center text-xs font-semibold text-slate-400 py-1">{d}</div>)}
+      </div>
+      <div className="grid grid-cols-7 gap-1">
+        {cells.map((cell, i) => (
+          <div key={i} className={`calendar-day relative aspect-square flex flex-col items-center justify-center rounded-lg text-xs font-medium select-none
+            ${cell ? getDayStyle(cell) : ''}`}
+            onClick={() => cell && isClickable(cell) && onSelectDate(cell.date)}>
+            {cell && (
+              <>
+                <span>{cell.day}</span>
+                {cell.info && cell.info.is_working && cell.date >= todayStr && (
+                  <span className={`text-[9px] font-normal ${selectedDate === cell.date ? 'text-blue-100' : cell.info.available_slots === 0 ? 'text-red-400' : 'text-emerald-500'}`}>
+                    {cell.info.available_slots > 0 ? `${cell.info.available_slots}` : 'Full'}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-3 mt-4 pt-3 border-t border-slate-100">
+        <div className="flex items-center gap-1.5 text-xs text-slate-500"><span className="w-3 h-3 rounded-full bg-emerald-400 inline-block"></span>Available</div>
+        <div className="flex items-center gap-1.5 text-xs text-slate-500"><span className="w-3 h-3 rounded-full bg-red-300 inline-block"></span>Full</div>
+        <div className="flex items-center gap-1.5 text-xs text-slate-500"><span className="w-3 h-3 rounded-full bg-blue-600 inline-block"></span>Selected</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Booking Modal ──────────────────────────────────────────────────────────────
+function BookingModal({ slot, date, onConfirm, onClose, loading }) {
+  const [name, setName] = useState('');
+  const [contact, setContact] = useState('');
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    onConfirm({ name: name.trim(), contact: contact.trim() });
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm fade-in" onClick={e => e.stopPropagation()}>
+        <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-t-2xl p-5 text-white">
+          <h3 className="text-lg font-semibold">Confirm Booking</h3>
+          <p className="text-blue-100 text-sm mt-0.5">{formatDate(date)} · {formatTime(slot.start_time)} – {formatTime(slot.end_time)}</p>
+        </div>
+        <form onSubmit={handleSubmit} className="p-5 space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Your Name <span className="text-red-500">*</span></label>
+            <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Enter your full name"
+              className="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent" required autoFocus />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Contact (optional)</label>
+            <input type="text" value={contact} onChange={e => setContact(e.target.value)} placeholder="Phone or email"
+              className="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent" />
+          </div>
+          <div className="flex gap-3 pt-1">
+            <button type="button" onClick={onClose} className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 transition-colors">Cancel</button>
+            <button type="submit" disabled={loading || !name.trim()}
+              className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
+              {loading ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+              {loading ? 'Booking…' : 'Confirm Booking'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ─── User View ─────────────────────────────────────────────────────────────────
+function UserView({ toast }) {
+  const now = new Date();
+  const [year, setYear] = useState(now.getFullYear());
+  const [month, setMonth] = useState(now.getMonth() + 1);
+  const [calData, setCalData] = useState([]);
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [slots, setSlots] = useState([]);
+  const [loadingSlots, setLoadingSlots] = useState(false);
+  const [bookingSlot, setBookingSlot] = useState(null);
+  const [booking, setBooking] = useState(false);
+  const [myBookings, setMyBookings] = useState([]);
+  const [providerName, setProviderName] = useState('My Practice');
+  const [cancelRef, setCancelRef] = useState('');
+  const [cancelling, setCancelling] = useState(false);
+  const [activeTab, setActiveTab] = useState('book'); // book | mybookings
+
+  useEffect(() => {
+    ax.get('/api/settings/public').then(r => setProviderName(r.data.provider_name)).catch(() => {});
+    const saved = JSON.parse(localStorage.getItem('my_bookings') || '[]');
+    setMyBookings(saved);
+  }, []);
+
+  useEffect(() => {
+    ax.get('/api/calendar', { params: { year, month } })
+      .then(r => setCalData(r.data))
+      .catch(() => toast('Could not load calendar', 'error'));
+  }, [year, month]);
+
+  useEffect(() => {
+    if (!selectedDate) return;
+    setLoadingSlots(true);
+    ax.get(`/api/slots/${selectedDate}`)
+      .then(r => setSlots(r.data))
+      .catch(() => toast('Could not load slots', 'error'))
+      .finally(() => setLoadingSlots(false));
+  }, [selectedDate]);
+
+  function handleMonthChange(delta) {
+    let m = month + delta, y = year;
+    if (m < 1) { m = 12; y--; }
+    if (m > 12) { m = 1; y++; }
+    setMonth(m); setYear(y);
+  }
+
+  async function confirmBooking({ name, contact }) {
+    const slot = bookingSlot;
+    setBooking(true);
+    try {
+      const r = await ax.post('/api/appointments', {
+        date: selectedDate,
+        start_time: slot.start_time,
+        end_time: slot.end_time,
+        user_name: name,
+        user_contact: contact || null,
+      });
+      const newBooking = { ...r.data, date: selectedDate };
+      const saved = JSON.parse(localStorage.getItem('my_bookings') || '[]');
+      saved.unshift(newBooking);
+      localStorage.setItem('my_bookings', JSON.stringify(saved.slice(0, 20)));
+      setMyBookings(saved.slice(0, 20));
+      setBookingSlot(null);
+      toast(`Booked! Your ref: ${r.data.booking_ref}`, 'success');
+      // Refresh slots & calendar
+      const slotRes = await ax.get(`/api/slots/${selectedDate}`);
+      setSlots(slotRes.data);
+      const calRes = await ax.get('/api/calendar', { params: { year, month } });
+      setCalData(calRes.data);
+    } catch (err) {
+      toast(err.response?.data?.detail || 'Booking failed', 'error');
+    } finally {
+      setBooking(false);
+    }
+  }
+
+  async function cancelBooking(ref) {
+    if (!ref) return;
+    setCancelling(true);
+    try {
+      await ax.delete(`/api/appointments/${ref.trim().toUpperCase()}`);
+      toast('Booking cancelled successfully', 'success');
+      const saved = JSON.parse(localStorage.getItem('my_bookings') || '[]');
+      const updated = saved.map(b => b.booking_ref === ref.trim().toUpperCase() ? { ...b, status: 'cancelled' } : b);
+      localStorage.setItem('my_bookings', JSON.stringify(updated));
+      setMyBookings(updated);
+      setCancelRef('');
+      if (selectedDate) {
+        const slotRes = await ax.get(`/api/slots/${selectedDate}`);
+        setSlots(slotRes.data);
+        const calRes = await ax.get('/api/calendar', { params: { year, month } });
+        setCalData(calRes.data);
+      }
+    } catch (err) {
+      toast(err.response?.data?.detail || 'Cancellation failed', 'error');
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50">
+      {/* Header */}
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+        <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 bg-blue-600 rounded-xl flex items-center justify-center text-white font-bold text-lg">+</div>
+            <div>
+              <h1 className="font-bold text-slate-800 text-lg leading-tight">{providerName}</h1>
+              <p className="text-xs text-slate-400">Book an Appointment</p>
+            </div>
+          </div>
+          <a href="#admin" onClick={() => window.location.hash = '#admin'} className="text-xs text-slate-400 hover:text-slate-600 transition-colors px-3 py-1.5 rounded-lg hover:bg-slate-100">
+            Admin →
+          </a>
+        </div>
+      </header>
+
+      <div className="max-w-6xl mx-auto px-4 py-8">
+        {/* Tab switcher */}
+        <div className="flex bg-white rounded-2xl shadow-sm border border-slate-200 p-1 w-fit mb-6">
+          <button onClick={() => setActiveTab('book')} className={`px-5 py-2 rounded-xl text-sm font-medium transition-all ${activeTab === 'book' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>Book Appointment</button>
+          <button onClick={() => setActiveTab('mybookings')} className={`px-5 py-2 rounded-xl text-sm font-medium transition-all relative ${activeTab === 'mybookings' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+            My Bookings
+            {myBookings.filter(b => b.status === 'booked').length > 0 && (
+              <span className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 rounded-full text-white text-[10px] flex items-center justify-center font-bold">
+                {myBookings.filter(b => b.status === 'booked').length}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {activeTab === 'book' ? (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Calendar */}
+            <div className="lg:col-span-1">
+              <MiniCalendar year={year} month={month} calData={calData} selectedDate={selectedDate}
+                onSelectDate={date => { setSelectedDate(date); setSlots([]); }} onMonthChange={handleMonthChange} />
+              <p className="text-xs text-slate-400 text-center mt-3">Numbers show available slots per day</p>
+            </div>
+
+            {/* Slots panel */}
+            <div className="lg:col-span-2">
+              {!selectedDate ? (
+                <div className="bg-white rounded-2xl border border-slate-200 h-full flex flex-col items-center justify-center p-12 text-center">
+                  <div className="text-5xl mb-4">📅</div>
+                  <h3 className="font-semibold text-slate-600 text-lg">Select a Date</h3>
+                  <p className="text-slate-400 text-sm mt-1 max-w-xs">Choose an available date from the calendar to see open appointment slots.</p>
+                </div>
+              ) : loadingSlots ? (
+                <div className="bg-white rounded-2xl border border-slate-200 h-full flex items-center justify-center p-12">
+                  <div className="w-8 h-8 border-3 border-blue-200 border-t-blue-600 rounded-full animate-spin"></div>
+                </div>
+              ) : slots.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-slate-200 h-full flex flex-col items-center justify-center p-12 text-center">
+                  <div className="text-4xl mb-4">🚫</div>
+                  <h3 className="font-semibold text-slate-600">No slots available</h3>
+                  <p className="text-slate-400 text-sm mt-1">This day has no available appointments. Please choose another date.</p>
+                </div>
+              ) : (
+                <div className="bg-white rounded-2xl border border-slate-200 p-6 fade-in">
+                  <div className="flex items-center justify-between mb-5">
+                    <div>
+                      <h2 className="font-semibold text-slate-800">{formatDate(selectedDate)}</h2>
+                      <p className="text-sm text-slate-400 mt-0.5">{slots.filter(s => s.is_available).length} of {slots.length} slots available</p>
+                    </div>
+                    <div className="flex gap-3 text-xs">
+                      <span className="flex items-center gap-1.5 text-slate-500"><span className="w-3 h-3 rounded-full bg-blue-100 border-2 border-blue-400 inline-block"></span>Available</span>
+                      <span className="flex items-center gap-1.5 text-slate-500"><span className="w-3 h-3 rounded-full bg-slate-200 inline-block"></span>Booked</span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {slots.map(slot => (
+                      <button key={slot.start_time}
+                        disabled={!slot.is_available}
+                        onClick={() => slot.is_available && setBookingSlot(slot)}
+                        className={`slot-available p-4 rounded-xl border-2 text-left transition-all
+                          ${slot.is_available
+                            ? 'border-blue-200 bg-blue-50 hover:bg-blue-100 hover:border-blue-400 cursor-pointer'
+                            : 'border-slate-100 bg-slate-50 cursor-not-allowed opacity-60'}`}>
+                        <div className={`font-semibold text-sm ${slot.is_available ? 'text-blue-700' : 'text-slate-400'}`}>
+                          {formatTime(slot.start_time)}
+                        </div>
+                        <div className={`text-xs mt-0.5 ${slot.is_available ? 'text-blue-500' : 'text-slate-400'}`}>
+                          – {formatTime(slot.end_time)}
+                        </div>
+                        <div className={`text-[10px] mt-1.5 font-medium ${slot.is_available ? 'text-emerald-600' : 'text-slate-400'}`}>
+                          {slot.is_available ? '● Available' : '● Booked'}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          /* My Bookings Tab */
+          <div className="max-w-2xl">
+            {/* Cancel by ref */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-5 mb-6">
+              <h3 className="font-semibold text-slate-700 mb-3">Cancel a Booking</h3>
+              <p className="text-sm text-slate-400 mb-4">Enter your booking reference to cancel an appointment.</p>
+              <div className="flex gap-3">
+                <input type="text" value={cancelRef} onChange={e => setCancelRef(e.target.value.toUpperCase())}
+                  placeholder="e.g. A1B2C3D4" maxLength={8}
+                  className="flex-1 border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400 uppercase" />
+                <button onClick={() => cancelBooking(cancelRef)} disabled={!cancelRef.trim() || cancelling}
+                  className="px-5 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2">
+                  {cancelling ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+                  Cancel
+                </button>
+              </div>
+            </div>
+
+            {/* Saved bookings from localStorage */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-5">
+              <h3 className="font-semibold text-slate-700 mb-1">Recent Bookings</h3>
+              <p className="text-xs text-slate-400 mb-4">Bookings made on this device are saved here.</p>
+              {myBookings.length === 0 ? (
+                <div className="text-center py-8">
+                  <div className="text-4xl mb-3">📋</div>
+                  <p className="text-slate-400 text-sm">No bookings found on this device.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {myBookings.map(b => (
+                    <div key={b.booking_ref} className={`flex items-center justify-between p-4 rounded-xl border ${b.status === 'cancelled' ? 'bg-slate-50 border-slate-100 opacity-60' : 'bg-blue-50 border-blue-100'}`}>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-sm font-bold text-slate-700">{b.booking_ref}</span>
+                          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${b.status === 'cancelled' ? 'bg-slate-200 text-slate-500' : 'bg-emerald-100 text-emerald-700'}`}>
+                            {b.status === 'cancelled' ? 'CANCELLED' : 'CONFIRMED'}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-500 mt-1">{formatDate(b.date)} · {formatTime(b.start_time)} – {formatTime(b.end_time)}</p>
+                        <p className="text-xs text-slate-400">{b.user_name}</p>
+                      </div>
+                      {b.status === 'booked' && (
+                        <button onClick={() => cancelBooking(b.booking_ref)}
+                          className="text-xs text-red-500 hover:text-red-700 font-medium px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors">
+                          Cancel
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {bookingSlot && (
+        <BookingModal slot={bookingSlot} date={selectedDate}
+          onConfirm={confirmBooking} onClose={() => setBookingSlot(null)} loading={booking} />
+      )}
+    </div>
+  );
+}
+
+// ─── Admin Login ───────────────────────────────────────────────────────────────
+function AdminLogin({ onSuccess, toast }) {
+  const [step, setStep] = useState('phone'); // phone | otp
+  const [phone, setPhone] = useState('');
+  const [otp, setOtp] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [countdown, setCountdown] = useState(0);
+
+  useEffect(() => {
+    if (countdown <= 0) return;
+    const t = setTimeout(() => setCountdown(c => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [countdown]);
+
+  async function requestOtp(e) {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      await ax.post('/api/auth/request-otp', { phone });
+      toast('OTP sent — check the backend terminal', 'success');
+      setStep('otp');
+      setCountdown(60);
+    } catch (err) {
+      toast(err.response?.data?.detail || 'Failed to send OTP', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function verifyOtp(e) {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      const r = await ax.post('/api/auth/verify-otp', { phone, otp });
+      setAdminToken(r.data.token);
+      toast('Logged in!', 'success');
+      onSuccess();
+    } catch (err) {
+      toast(err.response?.data?.detail || 'Verification failed', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-slate-100 flex items-center justify-center p-4">
+      <div className="w-full max-w-sm fade-in">
+        <div className="text-center mb-8">
+          <div className="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center text-white text-3xl mx-auto mb-4 shadow-lg">🔐</div>
+          <h1 className="text-2xl font-bold text-slate-800">Admin Access</h1>
+          <p className="text-slate-500 text-sm mt-1">Verify your mobile number to continue</p>
+        </div>
+
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+          {/* Step indicators */}
+          <div className="flex items-center gap-2 mb-6">
+            {[['phone', '1', 'Mobile number'], ['otp', '2', 'Enter OTP']].map(([s, n, label], i) => (
+              <React.Fragment key={s}>
+                {i > 0 && <div className={`flex-1 h-px ${step === 'otp' ? 'bg-indigo-400' : 'bg-slate-200'}`}></div>}
+                <div className="flex items-center gap-1.5">
+                  <div className={`w-6 h-6 rounded-full text-xs font-bold flex items-center justify-center
+                    ${step === s ? 'bg-indigo-600 text-white' : step === 'otp' && s === 'phone' ? 'bg-emerald-500 text-white' : 'bg-slate-200 text-slate-500'}`}>
+                    {step === 'otp' && s === 'phone' ? '✓' : n}
+                  </div>
+                  <span className={`text-xs font-medium ${step === s ? 'text-indigo-600' : 'text-slate-400'}`}>{label}</span>
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+
+          {step === 'phone' ? (
+            <form onSubmit={requestOtp} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">Mobile Number</label>
+                <input type="tel" value={phone} onChange={e => setPhone(e.target.value)}
+                  placeholder="+91XXXXXXXXXX" required autoFocus
+                  className="w-full border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 font-mono" />
+                <p className="text-xs text-slate-400 mt-1.5">Include country code (e.g. +91 for India)</p>
+              </div>
+              <button type="submit" disabled={loading || !phone.trim()}
+                className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-medium text-sm transition-colors disabled:opacity-50 flex items-center justify-center gap-2">
+                {loading ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+                Send OTP
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={verifyOtp} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">6-digit OTP</label>
+                <input type="text" value={otp} onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="••••••" required autoFocus maxLength={6} inputMode="numeric"
+                  className="w-full border border-slate-200 rounded-xl px-4 py-3 text-2xl text-center tracking-[0.5em] font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+                <p className="text-xs text-slate-400 mt-1.5 text-center">Check the backend terminal for your OTP</p>
+              </div>
+              <button type="submit" disabled={loading || otp.length !== 6}
+                className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-medium text-sm transition-colors disabled:opacity-50 flex items-center justify-center gap-2">
+                {loading ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+                Verify & Login
+              </button>
+              <div className="text-center">
+                {countdown > 0 ? (
+                  <p className="text-xs text-slate-400">Resend in {countdown}s</p>
+                ) : (
+                  <button type="button" onClick={() => { setStep('phone'); setOtp(''); }}
+                    className="text-xs text-indigo-500 hover:text-indigo-700 transition-colors">
+                    ← Change number / Resend OTP
+                  </button>
+                )}
+              </div>
+            </form>
+          )}
+        </div>
+
+        <p className="text-center text-xs text-slate-400 mt-4">
+          <a href="#" onClick={() => window.location.hash = ''} className="hover:text-slate-600 transition-colors">← Back to booking page</a>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin View ────────────────────────────────────────────────────────────────
+function AdminView({ toast }) {
+  const [authed, setAuthed] = useState(false);
+  const [checking, setChecking] = useState(true);
+  const [activeTab, setActiveTab] = useState('settings');
+
+  // Validate stored token on mount
+  useEffect(() => {
+    const token = getAdminToken();
+    if (!token) { setChecking(false); return; }
+    ax.get('/api/auth/me')
+      .then(() => setAuthed(true))
+      .catch(() => { clearAdminToken(); })
+      .finally(() => setChecking(false));
+  }, []);
+
+  async function logout() {
+    try { await ax.post('/api/auth/logout'); } catch {}
+    clearAdminToken();
+    setAuthed(false);
+    toast('Logged out', 'info');
+  }
+
+  if (checking) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="w-8 h-8 border-2 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+      </div>
+    );
+  }
+
+  if (!authed) {
+    return <AdminLogin toast={toast} onSuccess={() => setAuthed(true)} />;
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-100">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+        <div className="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center text-white font-bold text-lg">⚙</div>
+            <div>
+              <h1 className="font-bold text-slate-800 text-lg leading-tight">Admin Panel</h1>
+              <p className="text-xs text-slate-400">Manage your availability</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <a href="#" onClick={() => window.location.hash = ''} className="text-xs text-slate-400 hover:text-slate-600 px-3 py-1.5 rounded-lg hover:bg-slate-100 transition-colors">
+              ← User View
+            </a>
+            <button onClick={logout} className="text-xs text-red-500 hover:text-red-700 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors font-medium">
+              Logout
+            </button>
+          </div>
+        </div>
+        <div className="max-w-5xl mx-auto px-4 pb-0">
+          <div className="flex gap-1 overflow-x-auto">
+            {[['settings','⚙ Settings'],['hours','🕐 Working Hours'],['overrides','📅 Date Overrides'],['appointments','📋 Appointments']].map(([k,l]) => (
+              <button key={k} onClick={() => setActiveTab(k)}
+                className={`px-4 py-2.5 text-sm font-medium whitespace-nowrap border-b-2 transition-colors ${activeTab === k ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>
+                {l}
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+      <div className="max-w-5xl mx-auto px-4 py-8">
+        {activeTab === 'settings' && <AdminSettings toast={toast} />}
+        {activeTab === 'hours' && <AdminWorkingHours toast={toast} />}
+        {activeTab === 'overrides' && <AdminDateOverrides toast={toast} />}
+        {activeTab === 'appointments' && <AdminAppointments toast={toast} />}
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin: Settings ───────────────────────────────────────────────────────────
+function AdminSettings({ toast }) {
+  const [name, setName] = useState('');
+  const [duration, setDuration] = useState(30);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    ax.get('/api/admin/settings').then(r => {
+      setName(r.data.provider_name);
+      setDuration(r.data.session_duration);
+      setLoaded(true);
+    }).catch(() => toast('Could not load settings', 'error'));
+  }, []);
+
+  async function save(e) {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      await ax.put('/api/admin/settings', { provider_name: name, session_duration: parseInt(duration) });
+      toast('Settings saved!', 'success');
+    } catch {
+      toast('Save failed', 'error');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!loaded) return <div className="flex justify-center py-20"><div className="w-8 h-8 border-2 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div></div>;
+
+  return (
+    <div className="max-w-lg">
+      <h2 className="text-xl font-bold text-slate-800 mb-6">General Settings</h2>
+      <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+        <form onSubmit={save} className="space-y-5">
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-2">Practice / Provider Name</label>
+            <input type="text" value={name} onChange={e => setName(e.target.value)}
+              className="w-full border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" required />
+            <p className="text-xs text-slate-400 mt-1.5">Shown to users on the booking page.</p>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-2">Session Duration</label>
+            <div className="flex flex-wrap gap-3">
+              {[15, 20, 30, 45, 60, 90].map(d => (
+                <button key={d} type="button" onClick={() => setDuration(d)}
+                  className={`px-5 py-2.5 rounded-xl border-2 text-sm font-medium transition-all ${duration === d ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600 hover:border-indigo-300'}`}>
+                  {d} min
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-slate-400 mt-2">Each booking slot will be exactly this duration. This is a one-time setting.</p>
+          </div>
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+            <p className="text-xs text-amber-700"><strong>Note:</strong> Changing the session duration will affect how slots are generated for all future dates. Existing bookings will not be affected.</p>
+          </div>
+          <button type="submit" disabled={saving}
+            className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2">
+            {saving ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+            Save Settings
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin: Working Hours ──────────────────────────────────────────────────────
+function TimeRangePair({ label, startVal, endVal, onStart, onEnd, required = false, inputClass = '' }) {
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      {label && <span className="text-xs font-semibold text-slate-500 w-16 shrink-0">{label}</span>}
+      <input type="time" value={startVal || ''} onChange={e => onStart(e.target.value)}
+        className={`border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 ${inputClass}`} required={required} />
+      <span className="text-slate-400 text-xs">–</span>
+      <input type="time" value={endVal || ''} onChange={e => onEnd(e.target.value)}
+        className={`border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 ${inputClass}`} required={required} />
+    </div>
+  );
+}
+
+function AdminWorkingHours({ toast }) {
+  const [hours, setHours] = useState([]);
+  const [saving, setSaving] = useState(null);
+  const [applyAll, setApplyAll] = useState({ start: '09:00', end: '13:00', start2: '', end2: '', is_working: true });
+  const [applyAllLoading, setApplyAllLoading] = useState(false);
+
+  const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
+  useEffect(() => {
+    ax.get('/api/admin/working-hours').then(r => setHours(r.data)).catch(() => toast('Load failed', 'error'));
+  }, []);
+
+  async function saveDay(dow, data) {
+    setSaving(dow);
+    try {
+      const r = await ax.put(`/api/admin/working-hours/${dow}`, { day_of_week: dow, ...data });
+      setHours(prev => prev.map(h => h.day_of_week === dow ? r.data : h));
+      toast(`${DAY_NAMES[dow]} updated`, 'success');
+    } catch {
+      toast('Save failed', 'error');
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  async function applyToAll() {
+    setApplyAllLoading(true);
+    try {
+      const payload = {
+        day_of_week: 0,
+        is_working: applyAll.is_working,
+        start_time: applyAll.start,
+        end_time: applyAll.end,
+        start_time_2: applyAll.start2 || null,
+        end_time_2: applyAll.end2 || null,
+      };
+      const r = await ax.put('/api/admin/working-hours/apply-all', payload);
+      setHours(r.data);
+      toast('Applied to all days!', 'success');
+    } catch {
+      toast('Apply all failed', 'error');
+    } finally {
+      setApplyAllLoading(false);
+    }
+  }
+
+  function updateLocal(dow, field, value) {
+    setHours(prev => prev.map(h => h.day_of_week === dow ? { ...h, [field]: value } : h));
+  }
+
+  function toggleEveningSlot(dow, enable) {
+    setHours(prev => prev.map(h => h.day_of_week === dow
+      ? { ...h, start_time_2: enable ? '17:00' : null, end_time_2: enable ? '20:00' : null }
+      : h));
+  }
+
+  return (
+    <div>
+      <h2 className="text-xl font-bold text-slate-800 mb-2">Working Hours</h2>
+      <p className="text-sm text-slate-500 mb-6">Set morning and evening slots for each day of the week.</p>
+
+      {/* Apply to all */}
+      <div className="bg-indigo-50 border border-indigo-200 rounded-2xl p-5 mb-6">
+        <h3 className="font-semibold text-indigo-800 mb-4">Apply to All Days at Once</h3>
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs font-semibold text-indigo-700 w-20">Morning</span>
+            <input type="time" value={applyAll.start} onChange={e => setApplyAll(p => ({...p, start: e.target.value}))}
+              className="border border-indigo-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+            <span className="text-indigo-400 text-xs">–</span>
+            <input type="time" value={applyAll.end} onChange={e => setApplyAll(p => ({...p, end: e.target.value}))}
+              className="border border-indigo-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs font-semibold text-indigo-700 w-20">Evening</span>
+            <input type="time" value={applyAll.start2} onChange={e => setApplyAll(p => ({...p, start2: e.target.value}))} placeholder="--:--"
+              className="border border-indigo-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+            <span className="text-indigo-400 text-xs">–</span>
+            <input type="time" value={applyAll.end2} onChange={e => setApplyAll(p => ({...p, end2: e.target.value}))} placeholder="--:--"
+              className="border border-indigo-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+            <span className="text-xs text-indigo-500">(optional)</span>
+          </div>
+        </div>
+        <button onClick={applyToAll} disabled={applyAllLoading}
+          className="mt-4 px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2">
+          {applyAllLoading ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+          Apply to All Days
+        </button>
+      </div>
+
+      {/* Per-day rows */}
+      <div className="space-y-3">
+        {hours.map(h => (
+          <div key={h.day_of_week} className={`bg-white rounded-2xl border p-4 transition-all ${h.is_working ? 'border-slate-200' : 'border-slate-100 opacity-70'}`}>
+            <div className="flex flex-wrap items-center gap-4">
+              <div className="w-24 shrink-0">
+                <p className="font-semibold text-slate-700 text-sm">{DAY_NAMES[h.day_of_week]}</p>
+                <p className="text-xs text-slate-400">{['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][h.day_of_week]}</p>
+              </div>
+              {/* Working toggle */}
+              <div className={`relative w-11 h-6 rounded-full cursor-pointer transition-colors shrink-0 ${h.is_working ? 'bg-emerald-400' : 'bg-slate-200'}`}
+                onClick={() => updateLocal(h.day_of_week, 'is_working', !h.is_working)}>
+                <div className="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow-sm transition-transform" style={{transform: h.is_working ? 'translateX(20px)' : 'translateX(2px)'}}></div>
+              </div>
+              <span className={`text-xs font-medium ${h.is_working ? 'text-emerald-600' : 'text-slate-400'}`}>{h.is_working ? 'Working' : 'Off'}</span>
+              <div className="ml-auto">
+                <button onClick={() => saveDay(h.day_of_week, {
+                    is_working: h.is_working, start_time: h.start_time, end_time: h.end_time,
+                    start_time_2: h.start_time_2 || null, end_time_2: h.end_time_2 || null
+                  })} disabled={saving === h.day_of_week}
+                  className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5">
+                  {saving === h.day_of_week ? <span className="w-3 h-3 border border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+                  Save
+                </button>
+              </div>
+            </div>
+
+            {h.is_working && (
+              <div className="mt-3 pt-3 border-t border-slate-100 space-y-2.5">
+                {/* Morning */}
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-semibold text-amber-600 w-16 shrink-0">☀ Morning</span>
+                  <input type="time" value={h.start_time || ''} onChange={e => updateLocal(h.day_of_week, 'start_time', e.target.value)}
+                    className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+                  <span className="text-slate-400 text-xs">–</span>
+                  <input type="time" value={h.end_time || ''} onChange={e => updateLocal(h.day_of_week, 'end_time', e.target.value)}
+                    className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+                </div>
+                {/* Evening toggle + inputs */}
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-semibold text-indigo-600 w-16 shrink-0">🌙 Evening</span>
+                  {h.start_time_2 ? (
+                    <>
+                      <input type="time" value={h.start_time_2 || ''} onChange={e => updateLocal(h.day_of_week, 'start_time_2', e.target.value)}
+                        className="border border-indigo-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-indigo-50" />
+                      <span className="text-slate-400 text-xs">–</span>
+                      <input type="time" value={h.end_time_2 || ''} onChange={e => updateLocal(h.day_of_week, 'end_time_2', e.target.value)}
+                        className="border border-indigo-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-indigo-50" />
+                      <button onClick={() => toggleEveningSlot(h.day_of_week, false)}
+                        className="text-xs text-red-400 hover:text-red-600 px-2 py-1 rounded hover:bg-red-50 transition-colors">Remove</button>
+                    </>
+                  ) : (
+                    <button onClick={() => toggleEveningSlot(h.day_of_week, true)}
+                      className="text-xs text-indigo-500 hover:text-indigo-700 border border-dashed border-indigo-300 px-3 py-1.5 rounded-lg hover:bg-indigo-50 transition-colors">
+                      + Add evening slot
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin: Date Overrides ─────────────────────────────────────────────────────
+function AdminDateOverrides({ toast }) {
+  const [overrides, setOverrides] = useState([]);
+  const [form, setForm] = useState({ date: '', is_working: false, start_time: '', end_time: '', start_time_2: '', end_time_2: '', note: '' });
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(null);
+
+  useEffect(() => {
+    loadOverrides();
+  }, []);
+
+  async function loadOverrides() {
+    ax.get('/api/admin/date-overrides').then(r => setOverrides(r.data)).catch(() => toast('Load failed', 'error'));
+  }
+
+  async function saveOverride(e) {
+    e.preventDefault();
+    if (!form.date) return;
+    setSaving(true);
+    try {
+      await ax.put(`/api/admin/date-overrides/${form.date}`, {
+        date: form.date,
+        is_working: form.is_working,
+        start_time: form.is_working ? form.start_time : null,
+        end_time: form.is_working ? form.end_time : null,
+        start_time_2: (form.is_working && form.start_time_2) ? form.start_time_2 : null,
+        end_time_2: (form.is_working && form.end_time_2) ? form.end_time_2 : null,
+        note: form.note || null,
+      });
+      toast('Override saved!', 'success');
+      setForm({ date: '', is_working: false, start_time: '', end_time: '', start_time_2: '', end_time_2: '', note: '' });
+      loadOverrides();
+    } catch {
+      toast('Save failed', 'error');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteOverride(date) {
+    setDeleting(date);
+    try {
+      await ax.delete(`/api/admin/date-overrides/${date}`);
+      setOverrides(prev => prev.filter(o => o.date !== date));
+      toast('Override removed', 'success');
+    } catch {
+      toast('Delete failed', 'error');
+    } finally {
+      setDeleting(null);
+    }
+  }
+
+  return (
+    <div>
+      <h2 className="text-xl font-bold text-slate-800 mb-2">Date Overrides</h2>
+      <p className="text-sm text-slate-500 mb-6">Mark specific dates as off (holidays, breaks) or set custom hours for a particular day.</p>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Form */}
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+          <h3 className="font-semibold text-slate-700 mb-4">Add / Update Date Override</h3>
+          <form onSubmit={saveOverride} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">Date</label>
+              <input type="date" value={form.date} onChange={e => setForm(p => ({...p, date: e.target.value}))} min={today()}
+                className="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" required />
+            </div>
+            <div className="flex gap-4">
+              <label className={`flex-1 flex items-center gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${!form.is_working ? 'border-red-400 bg-red-50' : 'border-slate-200'}`}>
+                <input type="radio" name="working" checked={!form.is_working} onChange={() => setForm(p => ({...p, is_working: false}))} className="accent-red-500" />
+                <div>
+                  <p className="text-sm font-medium text-slate-700">Day Off</p>
+                  <p className="text-xs text-slate-400">No slots available</p>
+                </div>
+              </label>
+              <label className={`flex-1 flex items-center gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${form.is_working ? 'border-emerald-400 bg-emerald-50' : 'border-slate-200'}`}>
+                <input type="radio" name="working" checked={form.is_working} onChange={() => setForm(p => ({...p, is_working: true}))} className="accent-emerald-500" />
+                <div>
+                  <p className="text-sm font-medium text-slate-700">Custom Hours</p>
+                  <p className="text-xs text-slate-400">Override default times</p>
+                </div>
+              </label>
+            </div>
+            {form.is_working && (
+              <div className="space-y-3">
+                <div>
+                  <p className="text-xs font-semibold text-amber-600 mb-1.5">☀ Morning slot</p>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <label className="block text-xs text-slate-500 mb-1">Start</label>
+                      <input type="time" value={form.start_time} onChange={e => setForm(p => ({...p, start_time: e.target.value}))}
+                        className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" required />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs text-slate-500 mb-1">End</label>
+                      <input type="time" value={form.end_time} onChange={e => setForm(p => ({...p, end_time: e.target.value}))}
+                        className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" required />
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs font-semibold text-indigo-600 mb-1.5">🌙 Evening slot <span className="font-normal text-slate-400">(optional)</span></p>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <label className="block text-xs text-slate-500 mb-1">Start</label>
+                      <input type="time" value={form.start_time_2} onChange={e => setForm(p => ({...p, start_time_2: e.target.value}))}
+                        className="w-full border border-indigo-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-indigo-50" />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs text-slate-500 mb-1">End</label>
+                      <input type="time" value={form.end_time_2} onChange={e => setForm(p => ({...p, end_time_2: e.target.value}))}
+                        className="w-full border border-indigo-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-indigo-50" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Note (optional)</label>
+              <input type="text" value={form.note} onChange={e => setForm(p => ({...p, note: e.target.value}))} placeholder="e.g. Public holiday, Personal leave"
+                className="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+            </div>
+            <button type="submit" disabled={saving}
+              className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-medium text-sm transition-colors disabled:opacity-50 flex items-center justify-center gap-2">
+              {saving ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span> : null}
+              Save Override
+            </button>
+          </form>
+        </div>
+
+        {/* List */}
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+          <h3 className="font-semibold text-slate-700 mb-4">Existing Overrides</h3>
+          {overrides.length === 0 ? (
+            <div className="text-center py-8">
+              <div className="text-4xl mb-3">📆</div>
+              <p className="text-slate-400 text-sm">No date overrides set.</p>
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-96 overflow-y-auto">
+              {overrides.map(o => (
+                <div key={o.date} className="flex items-center gap-3 p-3 rounded-xl bg-slate-50 border border-slate-100">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-slate-700">{formatDate(o.date)}</p>
+                    {o.is_working ? (
+                      <div className="text-xs text-slate-500 mt-0.5 space-y-0.5">
+                        <p>☀ {formatTime(o.start_time)} – {formatTime(o.end_time)}</p>
+                        {o.start_time_2 && <p>🌙 {formatTime(o.start_time_2)} – {formatTime(o.end_time_2)}</p>}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-500 mt-0.5">Day Off{o.note && ` · ${o.note}`}</p>
+                    )}
+                  </div>
+                  <span className={`text-xs font-semibold px-2 py-1 rounded-full ${o.is_working ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
+                    {o.is_working ? 'Custom' : 'Off'}
+                  </span>
+                  <button onClick={() => deleteOverride(o.date)} disabled={deleting === o.date}
+                    className="text-slate-400 hover:text-red-500 transition-colors p-1 rounded">
+                    {deleting === o.date ? '…' : '✕'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin: Appointments ───────────────────────────────────────────────────────
+function AdminAppointments({ toast }) {
+  const [appointments, setAppointments] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState('upcoming');
+  const [cancelling, setCancelling] = useState(null);
+
+  const todayStr = today();
+
+  async function load() {
+    setLoading(true);
+    try {
+      const params = filter === 'upcoming' ? { from_date: todayStr } : {};
+      const r = await ax.get('/api/admin/appointments', { params });
+      setAppointments(r.data);
+    } catch {
+      toast('Load failed', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { load(); }, [filter]);
+
+  async function cancelAppt(ref) {
+    setCancelling(ref);
+    try {
+      await ax.delete(`/api/appointments/${ref}`);
+      toast('Appointment cancelled', 'success');
+      load();
+    } catch {
+      toast('Cancel failed', 'error');
+    } finally {
+      setCancelling(null);
+    }
+  }
+
+  // Group by date
+  const grouped = {};
+  appointments.forEach(a => {
+    if (!grouped[a.date]) grouped[a.date] = [];
+    grouped[a.date].push(a);
+  });
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h2 className="text-xl font-bold text-slate-800">Appointments</h2>
+          <p className="text-sm text-slate-500 mt-0.5">{appointments.length} appointment{appointments.length !== 1 ? 's' : ''}</p>
+        </div>
+        <div className="flex bg-white rounded-xl border border-slate-200 p-1">
+          {[['upcoming','Upcoming'],['all','All']].map(([k,l]) => (
+            <button key={k} onClick={() => setFilter(k)}
+              className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${filter === k ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:text-slate-700'}`}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="flex justify-center py-16"><div className="w-8 h-8 border-2 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div></div>
+      ) : appointments.length === 0 ? (
+        <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center">
+          <div className="text-5xl mb-4">📭</div>
+          <h3 className="font-semibold text-slate-600">No appointments</h3>
+          <p className="text-slate-400 text-sm mt-1">No {filter === 'upcoming' ? 'upcoming ' : ''}appointments found.</p>
+        </div>
+      ) : (
+        <div className="space-y-6">
+          {Object.entries(grouped).map(([date, appts]) => (
+            <div key={date} className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+              <div className="bg-slate-50 border-b border-slate-200 px-5 py-3 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  {date === todayStr && <span className="text-xs font-bold px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">TODAY</span>}
+                  <h3 className="font-semibold text-slate-700 text-sm">{formatDate(date)}</h3>
+                </div>
+                <span className="text-xs text-slate-400">{appts.length} booking{appts.length !== 1 ? 's' : ''}</span>
+              </div>
+              <div className="divide-y divide-slate-100">
+                {appts.map(a => (
+                  <div key={a.id} className="flex items-center gap-4 px-5 py-3.5">
+                    <div className="w-20 shrink-0">
+                      <p className="text-sm font-semibold text-slate-700">{formatTime(a.start_time)}</p>
+                      <p className="text-xs text-slate-400">{formatTime(a.end_time)}</p>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium text-slate-700 text-sm">{a.user_name}</p>
+                      {a.user_contact && <p className="text-xs text-slate-400">{a.user_contact}</p>}
+                    </div>
+                    <span className="font-mono text-xs bg-slate-100 px-2.5 py-1 rounded-lg text-slate-500">{a.booking_ref}</span>
+                    <button onClick={() => cancelAppt(a.booking_ref)} disabled={cancelling === a.booking_ref}
+                      className="text-xs text-red-500 hover:text-red-700 font-medium px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors flex items-center gap-1">
+                      {cancelling === a.booking_ref ? '…' : 'Cancel'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── App Root ──────────────────────────────────────────────────────────────────
+function App() {
+  const [view, setView] = useState(window.location.hash === '#admin' ? 'admin' : 'user');
+  const { toasts, add: toast, remove } = useToast();
+
+  useEffect(() => {
+    function onHashChange() {
+      setView(window.location.hash === '#admin' ? 'admin' : 'user');
+    }
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  return (
+    <>
+      {view === 'user' ? <UserView toast={toast} /> : <AdminView toast={toast} />}
+      <Toast toasts={toasts} remove={remove} />
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
