@@ -5,7 +5,7 @@ import os
 
 # On Render, use the persistent disk mounted at /data; otherwise use local path
 if os.getenv("RENDER"):
-    DB_PATH = "/data/appointments.db"
+    DB_PATH = "/tmp/appointments.db"
 else:
     DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "appointments.db")
 
